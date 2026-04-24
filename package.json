@@ -1,0 +1,22 @@
+{
+  "name": "pi-redact",
+  "version": "0.1.0",
+  "description": "Pi extension: redact sensitive information from prompts using a local LLM",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hoangtrann/pi-redact.git"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
