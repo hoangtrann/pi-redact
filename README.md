@@ -7,9 +7,13 @@ A [Pi Coding Agent](https://github.com/badlogic/pi-mono) extension that automati
 
 ```
 User Prompt → pi-redact → Redacted Prompt → Main LLM
-                 ↓
-          Local LLM + Regex
-          (PII detection)
+   (text)        ↓
+              Local LLM + Regex
+              (PII detection)
+
+   (images)      ↓
+              OCR (tesseract) + PII detection
+              → blackout / describe / strip
 ```
 
 1. **Regex fast-path** catches obvious patterns: emails, phone numbers, SSNs, credit cards, API keys, IP addresses
@@ -49,6 +53,9 @@ Add to your `settings.json`:
     "timeoutMs": 15000,
     "minPromptLength": 10,
     "notifyOnRedact": true,
+    "redactImages": true,
+    "imageAction": "blackout",
+    "imageModel": "llava",
     "categories": [
       "email", "phone", "ssn", "credit_card",
       "address", "name", "api_key", "password",
@@ -67,6 +74,9 @@ Add to your `settings.json`:
 | `timeoutMs` | number | `15000` | Request timeout in milliseconds |
 | `minPromptLength` | number | `10` | Skip redaction for very short prompts |
 | `notifyOnRedact` | boolean | `true` | Show notification when redaction occurs |
+| `redactImages` | boolean | `true` | Enable image PII scanning |
+| `imageAction` | string | `blackout` | Image redaction strategy: `"blackout"`, `"describe"`, or `"strip"` |
+| `imageModel` | string | `llava` | Vision model for describe mode fallback |
 | `categories` | string[] | all | PII categories to detect |
 
 ### Environment Variables
@@ -155,6 +165,50 @@ pi --redact=false  # Disable for this session
 | `address` | LLM only | Physical addresses |
 | `password` | LLM only | Passwords in context |
 | `date_of_birth` | LLM only | Birth dates in context |
+
+## Image Redaction
+
+pi-redact can detect and redact PII from images attached to prompts — both clipboard-pasted images and image file paths referenced in text.
+
+### Strategies
+
+| Strategy | Description | Requirements |
+|----------|-------------|--------------|
+| `blackout` | OCR the image, detect PII, draw black boxes over sensitive regions | `uv`, `tesseract-ocr` |
+| `describe` | Extract text from image, redact PII, replace image with text description | `uv` (markitdown) or vision LLM |
+| `strip` | Remove the image entirely | None |
+
+### Fallback Chain
+
+If the required tools aren't available, pi-redact falls back gracefully:
+
+```
+blackout → describe → strip
+```
+
+### System Requirements (for image redaction)
+
+**For `blackout` mode:**
+```bash
+# Install uv (Python package manager)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Install tesseract OCR
+sudo apt install tesseract-ocr  # Debian/Ubuntu
+brew install tesseract           # macOS
+```
+
+The Python dependencies (`pytesseract`, `pillow`) are automatically managed by `uv run` — no manual `pip install` needed.
+
+**For `describe` mode:**
+```bash
+# Option 1: markitdown (via uvx)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+# markitdown is auto-installed on first use
+
+# Option 2: Vision LLM (via Ollama)
+ollama pull llava
+```
 
 ## License
 

@@ -21,10 +21,11 @@
  *   }
  */
 
-import type { ExtensionAPI, InputEventResult } from "@mariozechner/pi-coding-agent";
-import { existsSync, readFileSync } from "fs";
-import { join } from "path";
-import { homedir } from "os";
+import type { ExtensionAPI, InputEventResult, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, unlinkSync } from "fs";
+import { join, dirname } from "path";
+import { homedir, tmpdir } from "os";
+import { fileURLToPath } from "url";
 
 // ============================================================================
 // Configuration
@@ -59,6 +60,12 @@ interface RedactConfig {
 	minPromptLength: number;
 	/** Whether to show a notification when redaction occurs. Default: true */
 	notifyOnRedact: boolean;
+	/** Whether to scan images for PII. Default: true */
+	redactImages: boolean;
+	/** Image redaction strategy. Default: "blackout" */
+	imageAction: "blackout" | "describe" | "strip";
+	/** Vision-capable model for describe mode fallback. Default: "llava" */
+	imageModel: string;
 }
 
 const ALL_CATEGORIES: PiiCategory[] = [
@@ -83,6 +90,9 @@ const DEFAULT_CONFIG: RedactConfig = {
 	categories: ALL_CATEGORIES,
 	minPromptLength: 10,
 	notifyOnRedact: true,
+	redactImages: true,
+	imageAction: "blackout",
+	imageModel: "llava",
 };
 
 /** Pi's config directory name */
@@ -152,6 +162,9 @@ function mergeFromSettingsFile(config: RedactConfig, filePath: string): void {
 		if (typeof rs.timeoutMs === "number" && rs.timeoutMs > 0) config.timeoutMs = rs.timeoutMs;
 		if (typeof rs.minPromptLength === "number" && rs.minPromptLength >= 0) config.minPromptLength = rs.minPromptLength;
 		if (typeof rs.notifyOnRedact === "boolean") config.notifyOnRedact = rs.notifyOnRedact;
+		if (typeof rs.redactImages === "boolean") config.redactImages = rs.redactImages;
+		if (rs.imageAction === "blackout" || rs.imageAction === "describe" || rs.imageAction === "strip") config.imageAction = rs.imageAction;
+		if (typeof rs.imageModel === "string") config.imageModel = rs.imageModel;
 		if (Array.isArray(rs.categories)) {
 			const valid = rs.categories.filter((c): c is PiiCategory => ALL_CATEGORIES.includes(c as PiiCategory));
 			if (valid.length > 0) config.categories = valid;
@@ -451,6 +464,303 @@ async function redactPrompt(text: string, config: RedactConfig): Promise<RedactR
 }
 
 // ============================================================================
+// Whimsical Progress Messages
+// ============================================================================
+
+const REDACT_MESSAGES = [
+	"🛡️ Scanning for secrets...",
+	"🔍 Hunting for PII...",
+	"🕵️ Inspecting your prose...",
+	"🧹 Sweeping for sensitive bits...",
+	"🔐 Checking for classified info...",
+	"🛡️ Deploying privacy shields...",
+	"🔎 Magnifying the details...",
+	"🧪 Analyzing for leaks...",
+	"🔒 Engaging redaction protocols...",
+	"🫣 Averting eyes from secrets...",
+	"🧙 Casting obfuscation spell...",
+	"🎭 Masking the sensitive bits...",
+	"🤫 Shh... finding secrets...",
+	"📸 Inspecting images for PII...",
+	"🖼️ Analyzing visual content...",
+	"🔲 Preparing redaction boxes...",
+];
+
+// ============================================================================
+// Image Redaction Pipeline
+// ============================================================================
+
+/** Regex to detect image file paths in prompt text */
+const IMAGE_PATH_PATTERN = /(?:^|\s)((?:\/[\w.\-~]+)+\.(?:png|jpe?g|gif|webp|bmp|tiff?))\b/gi;
+
+interface ImageRedactResult {
+	text: string;
+	images: Array<{ type: string; source: { type: string; mediaType: string; data: string } }>;
+	imageFindings: Array<{ type: string; source: string }>;
+}
+
+interface OcrWord {
+	text: string;
+	left: number;
+	top: number;
+	width: number;
+	height: number;
+	conf: number;
+}
+
+interface OcrResult {
+	text: string;
+	words: OcrWord[];
+}
+
+function getScriptDir(): string {
+	try {
+		return dirname(fileURLToPath(import.meta.url));
+	} catch {
+		return __dirname;
+	}
+}
+
+function getRedactImageScriptPath(): string {
+	const extDir = getScriptDir();
+	// scripts/ is a sibling of extensions/
+	return join(dirname(extDir), "scripts", "redact_image.py");
+}
+
+function extractImagePaths(text: string): Array<{ path: string; start: number; end: number }> {
+	const results: Array<{ path: string; start: number; end: number }> = [];
+	IMAGE_PATH_PATTERN.lastIndex = 0;
+	let m: RegExpExecArray | null = null;
+	while ((m = IMAGE_PATH_PATTERN.exec(text)) !== null) {
+		const path = m[1];
+		const start = m.index + m[0].indexOf(path);
+		results.push({ path, start, end: start + path.length });
+	}
+	return results;
+}
+
+function mimeFromExt(ext: string): string {
+	const map: Record<string, string> = {
+		".png": "image/png",
+		".jpg": "image/jpeg",
+		".jpeg": "image/jpeg",
+		".gif": "image/gif",
+		".webp": "image/webp",
+		".bmp": "image/bmp",
+		".tiff": "image/tiff",
+		".tif": "image/tiff",
+	};
+	return map[ext.toLowerCase()] ?? "image/png";
+}
+
+function saveBase64ToTemp(data: string, mimeType: string): string {
+	const dir = join(tmpdir(), "pi-redact-images");
+	mkdirSync(dir, { recursive: true });
+	const ext = mimeType.includes("png") ? ".png" : mimeType.includes("jpeg") ? ".jpg" : ".png";
+	const name = `img-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+	const filePath = join(dir, name);
+	writeFileSync(filePath, Buffer.from(data, "base64"));
+	return filePath;
+}
+
+async function runBlackoutScript(
+	mode: "ocr" | "blackout",
+	args: string[],
+	pi: ExtensionAPI,
+): Promise<{ stdout: string; ok: boolean }> {
+	const scriptPath = getRedactImageScriptPath();
+	if (!existsSync(scriptPath)) {
+		return { stdout: "", ok: false };
+	}
+	try {
+		const result = await pi.exec("uv", ["run", scriptPath, mode, ...args], { timeout: 30000 });
+		return { stdout: result.stdout ?? "", ok: result.code === 0 };
+	} catch {
+		return { stdout: "", ok: false };
+	}
+}
+
+async function ocrImage(imagePath: string, pi: ExtensionAPI): Promise<OcrResult | null> {
+	const { stdout, ok } = await runBlackoutScript("ocr", ["--input", imagePath], pi);
+	if (!ok) return null;
+	try {
+		return JSON.parse(stdout) as OcrResult;
+	} catch {
+		return null;
+	}
+}
+
+async function blackoutImage(
+	imagePath: string,
+	outputPath: string,
+	piiWords: string[],
+	pi: ExtensionAPI,
+): Promise<boolean> {
+	const { ok } = await runBlackoutScript(
+		"blackout",
+		["--input", imagePath, "--output", outputPath, "--words", piiWords.join(",")],
+		pi,
+	);
+	return ok;
+}
+
+async function extractImageTextViaMarkitdown(imagePath: string, pi: ExtensionAPI): Promise<string | null> {
+	try {
+		const result = await pi.exec("uvx", ["markitdown", imagePath], { timeout: 30000 });
+		if (result.code === 0 && result.stdout) return result.stdout.trim();
+		return null;
+	} catch {
+		return null;
+	}
+}
+
+async function extractImageTextViaVisionLLM(imagePath: string, config: RedactConfig): Promise<string | null> {
+	const imageData = readFileSync(imagePath).toString("base64");
+	const ext = imagePath.slice(imagePath.lastIndexOf("."));
+	const mime = mimeFromExt(ext);
+
+	try {
+		const url = `${config.host.replace(/\/+$/, "")}/api/generate`;
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), config.timeoutMs);
+		try {
+			const resp = await fetch(url, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: config.imageModel,
+					prompt: "Describe this image in detail. Include all visible text. Do not omit any text content.",
+					images: [imageData],
+					stream: false,
+				}),
+				signal: controller.signal,
+			});
+			if (!resp.ok) return null;
+			const data = (await resp.json()) as { response?: string };
+			return data.response ?? null;
+		} finally {
+			clearTimeout(timeout);
+		}
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Redact a single image file. Returns the redacted image path (blackout),
+ * a text description (describe), or null (strip / failure).
+ */
+async function redactSingleImage(
+	imagePath: string,
+	config: RedactConfig,
+	pi: ExtensionAPI,
+): Promise<{ action: "replaced" | "described" | "stripped"; outputPath?: string; description?: string; piiTypes: string[] }> {
+	const piiTypes: string[] = [];
+
+	// --- blackout mode ---
+	if (config.imageAction === "blackout") {
+		const ocrResult = await ocrImage(imagePath, pi);
+		if (ocrResult && ocrResult.text.length > 0) {
+			const textResult = await redactPrompt(ocrResult.text, config);
+			if (textResult.redacted && textResult.findings.length > 0) {
+				for (const f of textResult.findings) piiTypes.push(f.type);
+				const piiWords = textResult.findings.map((f) => f.original);
+				const outPath = imagePath.replace(/(\.\w+)$/, `-redacted$1`);
+				const ok = await blackoutImage(imagePath, outPath, piiWords, pi);
+				if (ok) return { action: "replaced", outputPath: outPath, piiTypes };
+			} else {
+				// OCR found text but no PII — image is clean
+				return { action: "replaced", outputPath: imagePath, piiTypes: [] };
+			}
+		}
+		// Fallback: blackout failed (no tesseract/uv) → try describe
+	}
+
+	// --- describe mode (or blackout fallback) ---
+	if (config.imageAction === "describe" || config.imageAction === "blackout") {
+		let extractedText = await extractImageTextViaMarkitdown(imagePath, pi);
+		if (!extractedText) {
+			extractedText = await extractImageTextViaVisionLLM(imagePath, config);
+		}
+		if (extractedText) {
+			const textResult = await redactPrompt(extractedText, config);
+			if (textResult.redacted) {
+				for (const f of textResult.findings) piiTypes.push(f.type);
+				return { action: "described", description: textResult.text, piiTypes };
+			}
+			// Text extracted but no PII
+			return { action: "described", description: extractedText, piiTypes: [] };
+		}
+		// Fallback → strip
+	}
+
+	// --- strip mode (or final fallback) ---
+	return { action: "stripped", piiTypes };
+}
+
+async function redactImages(
+	text: string,
+	images: Array<{ type: string; source: { type: string; mediaType: string; data: string } }> | undefined,
+	config: RedactConfig,
+	pi: ExtensionAPI,
+): Promise<ImageRedactResult> {
+	const allFindings: Array<{ type: string; source: string }> = [];
+	let processedText = text;
+	const processedImages = [...(images ?? [])];
+
+	// 1. Process image file paths in text
+	const imagePaths = extractImagePaths(text);
+	// Process from end to preserve indices
+	for (const imgRef of [...imagePaths].reverse()) {
+		if (!existsSync(imgRef.path)) continue;
+		const result = await redactSingleImage(imgRef.path, config, pi);
+		if (result.piiTypes.length === 0 && result.action === "replaced") continue; // clean image
+		for (const t of result.piiTypes) allFindings.push({ type: t, source: imgRef.path });
+
+		if (result.action === "replaced" && result.outputPath && result.outputPath !== imgRef.path) {
+			processedText = processedText.slice(0, imgRef.start) + result.outputPath + processedText.slice(imgRef.end);
+		} else if (result.action === "described" && result.description) {
+			const replacement = `[Image description: ${result.description}]`;
+			processedText = processedText.slice(0, imgRef.start) + replacement + processedText.slice(imgRef.end);
+		} else if (result.action === "stripped") {
+			processedText = processedText.slice(0, imgRef.start) + "[REDACTED_IMAGE]" + processedText.slice(imgRef.end);
+		}
+	}
+
+	// 2. Process base64 images in event.images
+	const keptImages: typeof processedImages = [];
+	for (const img of processedImages) {
+		if (img.type !== "image" || img.source?.type !== "base64") {
+			keptImages.push(img);
+			continue;
+		}
+		const tmpPath = saveBase64ToTemp(img.source.data, img.source.mediaType);
+		try {
+			const result = await redactSingleImage(tmpPath, config, pi);
+			if (result.piiTypes.length === 0 && result.action !== "stripped") {
+				keptImages.push(img); // clean — keep original
+				continue;
+			}
+			for (const t of result.piiTypes) allFindings.push({ type: t, source: "clipboard" });
+
+			if (result.action === "replaced" && result.outputPath) {
+				const newData = readFileSync(result.outputPath).toString("base64");
+				keptImages.push({ type: "image", source: { type: "base64", mediaType: img.source.mediaType, data: newData } });
+				try { unlinkSync(result.outputPath); } catch { /* ignore */ }
+			} else if (result.action === "described" && result.description) {
+				// Image replaced by text — append to prompt text instead
+				processedText += `\n\n[Image description: ${result.description}]`;
+			}
+			// stripped → image just gets dropped
+		} finally {
+			try { unlinkSync(tmpPath); } catch { /* ignore */ }
+		}
+	}
+
+	return { text: processedText, images: keptImages, imageFindings: allFindings };
+}
+
+// ============================================================================
 // Extension
 // ============================================================================
 
@@ -465,7 +775,7 @@ export default function redactExtension(pi: ExtensionAPI): void {
 		llmAvailable = null; // Reset availability check for new session
 
 		if (config.enabled && ctx.hasUI) {
-			ctx.ui.setStatus("redact", "🛡️ redact");
+			ctx.ui.setStatus("redact", "🛡️");
 		}
 	});
 
@@ -485,13 +795,16 @@ export default function redactExtension(pi: ExtensionAPI): void {
 			if (trimmed === "status" || trimmed === "") {
 				const statusLines = [
 					`pi-redact status:`,
-					`  enabled:    ${config.enabled}`,
-					`  host:       ${config.host}`,
-					`  model:      ${config.model}`,
-					`  apiFormat:  ${config.apiFormat}`,
-					`  timeoutMs:  ${config.timeoutMs}`,
-					`  categories: ${config.categories.join(", ")}`,
-					`  llm:        ${llmAvailable === null ? "not checked yet" : llmAvailable ? "reachable" : "unreachable (regex-only mode)"}`,
+					`  enabled:      ${config.enabled}`,
+					`  host:         ${config.host}`,
+					`  model:        ${config.model}`,
+					`  apiFormat:    ${config.apiFormat}`,
+					`  timeoutMs:    ${config.timeoutMs}`,
+					`  categories:   ${config.categories.join(", ")}`,
+					`  redactImages: ${config.redactImages}`,
+					`  imageAction:  ${config.imageAction}`,
+					`  imageModel:   ${config.imageModel}`,
+					`  llm:          ${llmAvailable === null ? "not checked yet" : llmAvailable ? "reachable" : "unreachable (regex-only mode)"}`,
 				];
 				if (lastRedactionInfo?.redacted) {
 					statusLines.push(
@@ -504,7 +817,7 @@ export default function redactExtension(pi: ExtensionAPI): void {
 
 			if (trimmed === "on") {
 				config.enabled = true;
-				ctx.ui.setStatus("redact", "🛡️ redact");
+				ctx.ui.setStatus("redact", "🛡️");
 				ctx.ui.notify("pi-redact enabled", "info");
 				return;
 			}
@@ -559,44 +872,93 @@ export default function redactExtension(pi: ExtensionAPI): void {
 			return { action: "continue" };
 		}
 
-		// Don't redact very short prompts
-		if (event.text.length < config.minPromptLength) {
+		const hasImages = config.redactImages && ((event.images && event.images.length > 0) || IMAGE_PATH_PATTERN.test(event.text));
+		// Reset regex lastIndex after test
+		IMAGE_PATH_PATTERN.lastIndex = 0;
+
+		const hasText = event.text.length >= config.minPromptLength;
+
+		if (!hasText && !hasImages) {
 			return { action: "continue" };
 		}
 
+		// Start whimsical progress rotation
+		let msgIdx = Math.floor(Math.random() * REDACT_MESSAGES.length);
+		if (ctx.hasUI) {
+			ctx.ui.setWorkingMessage(REDACT_MESSAGES[msgIdx]);
+			ctx.ui.setStatus("redact", "🛡️ scanning…");
+		}
+		const ticker = setInterval(() => {
+			msgIdx = (msgIdx + 1) % REDACT_MESSAGES.length;
+			if (ctx.hasUI) ctx.ui.setWorkingMessage(REDACT_MESSAGES[msgIdx]);
+		}, 1500);
+
 		try {
-			const result = await redactPrompt(event.text, config);
+			let processedText = event.text;
+			let processedImages = event.images ?? [];
+			let totalFindings = 0;
+			const allTypes: string[] = [];
 
-			// Track LLM availability for status reporting
-			llmAvailable = true;
+			// 1. Redact images (if enabled and present)
+			if (hasImages) {
+				const imageResult = await redactImages(processedText, event.images, config, pi);
+				processedText = imageResult.text;
+				processedImages = imageResult.images as typeof processedImages;
+				for (const f of imageResult.imageFindings) {
+					totalFindings++;
+					if (!allTypes.includes(f.type)) allTypes.push(f.type);
+				}
+			}
 
-			if (!result.redacted) {
+			// 2. Redact text PII
+			if (hasText) {
+				const textResult = await redactPrompt(processedText, config);
+				llmAvailable = true;
+
+				if (textResult.redacted) {
+					processedText = textResult.text;
+					totalFindings += textResult.findings.length;
+					for (const f of textResult.findings) {
+						if (!allTypes.includes(f.type)) allTypes.push(f.type);
+					}
+					lastRedactionInfo = textResult;
+				}
+			}
+
+			// 3. Nothing redacted
+			if (totalFindings === 0) {
 				return { action: "continue" };
 			}
 
-			lastRedactionInfo = result;
-
+			// 4. Notify user
 			if (config.notifyOnRedact && ctx.hasUI) {
-				const types = [...new Set(result.findings.map((f) => f.type))];
 				ctx.ui.notify(
-					`🛡️ Redacted ${result.findings.length} sensitive item(s): ${types.join(", ")}`,
+					`🛡️ Redacted ${totalFindings} sensitive item(s): ${allTypes.join(", ")}`,
 					"warning",
 				);
+				ctx.ui.setStatus("redact", `🛡️ ${totalFindings} redacted`);
 			}
 
 			return {
 				action: "transform",
-				text: result.text,
-				images: event.images,
+				text: processedText,
+				images: processedImages,
 			};
 		} catch (error) {
-			// If redaction fails, let the original prompt through
-			// but warn the user
 			if (ctx.hasUI) {
 				const msg = error instanceof Error ? error.message : String(error);
 				ctx.ui.notify(`⚠️ pi-redact error (prompt sent unredacted): ${msg}`, "warning");
 			}
 			return { action: "continue" };
+		} finally {
+			clearInterval(ticker);
+			if (ctx.hasUI) {
+				ctx.ui.setWorkingMessage();
+				// Restore idle status after a short delay
+				setTimeout(() => {
+					if (config.enabled && ctx.hasUI) ctx.ui.setStatus("redact", "🛡️");
+				}, 5000);
+			}
 		}
 	});
 
